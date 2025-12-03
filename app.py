@@ -1,18 +1,19 @@
 import gradio as gr
-import time
-import threading
+import asyncio
 
-# GLOBAL autoplay flag
-autoplay_flag = {"running": False}
-
-
-# Generate step-by-step search data
+# -----------------------------
+# Helper logic
+# -----------------------------
 def generate_steps(arr_str, target_str):
+    """
+    Returns: (steps_list, index_start, message)
+    steps_list: list of tuples (html_visual, html_explanation)
+    """
     # Validate and parse array
     try:
-        arr = [int(x.strip()) for x in arr_str.split(",") if x.strip()]
-    except:
-        return [], 0, "Error: List must contain only integers."
+        arr = [int(x.strip()) for x in arr_str.split(",") if x.strip() != ""]
+    except Exception:
+        return [], 0, "Error: List must contain only integers separated by commas."
 
     # Validate target
     if target_str.strip() == "":
@@ -20,187 +21,223 @@ def generate_steps(arr_str, target_str):
 
     try:
         target = int(target_str)
-    except:
+    except Exception:
         return [], 0, "Error: Target must be an integer."
 
     steps = []
-
-    # Create visualization for each step
     for i, val in enumerate(arr):
         visual_boxes = []
         for j, v in enumerate(arr):
             if i == j:
+                # highlighted current index
                 visual_boxes.append(
-                    f"<span style='background-color:#90EE90;padding:6px;border-radius:5px;font-weight:bold'>{v}</span>"
+                    f"<span style='background:#90EE90;padding:8px;border-radius:6px;margin:2px;display:inline-block;font-weight:700'>{v}</span>"
                 )
             else:
                 visual_boxes.append(
-                    f"<span style='padding:6px;border:1px solid #ccc;border-radius:5px'>{v}</span>"
+                    f"<span style='padding:8px;border:1px solid #ddd;border-radius:6px;margin:2px;display:inline-block'>{v}</span>"
                 )
 
         explanation = f"Step {i+1}: Compare target ({target}) with arr[{i}] = {val}"
-
         if val == target:
             explanation += "<br><br><b>✔ Target found!</b>"
             steps.append((" ".join(visual_boxes), explanation))
-            return steps, 0, ""
+            return steps, 0, ""  # return early on found
 
         steps.append((" ".join(visual_boxes), explanation))
 
-    # If not found
+    # Not found step
     steps.append((
-        " ".join([f"<span style='padding:6px;border:1px solid #ccc;border-radius:5px'>{v}</span>" for v in arr]),
+        " ".join([f"<span style='padding:8px;border:1px solid #ddd;border-radius:6px;margin:2px;display:inline-block'>{v}</span>" for v in arr]),
         "<b>✘ Target not found in the list.</b>"
     ))
-
     return steps, 0, ""
 
 
-# Update which step to show
+def clamp_index(i, steps):
+    if not steps:
+        return 0
+    return max(0, min(i, len(steps) - 1))
+
+
 def update_step(step_index, steps):
+    """
+    Regular synchronous updater used by Prev/Next/Generate/Reset.
+    Returns (visual_html, explanation_html, new_index)
+    """
     if not steps:
         return "", "", 0
-
-    step_index = max(0, min(step_index, len(steps)-1))
+    step_index = clamp_index(step_index, steps)
     visual, explain = steps[step_index]
     return visual, explain, step_index
 
 
-# AUTOPLAY LOOP (threaded)
-def autoplay_loop(steps, state_index, visual_output, explanation_output, update_fn):
-    while autoplay_flag["running"]:
-        time.sleep(1)
+# -----------------------------
+# Async autoplay generator
+# -----------------------------
+async def play_generator(steps, current_index, autoplay_flag):
+    """
+    Async generator that yields UI updates (visual_html, explanation_html, index)
+    It checks autoplay_flag (a boolean). If autoplay_flag is False, it stops.
+    """
+    # If nothing to play, return nothing
+    if not steps:
+        yield "", "", 0
+        return
 
-        # Stop if no steps
-        if not steps:
-            break
+    i = clamp_index(current_index, steps)
 
-        # If reached last step → stop autoplay
-        if state_index["value"] >= len(steps) - 1:
-            autoplay_flag["running"] = False
-            break
+    # If starting point is already at last step, just yield the current step
+    if i >= len(steps):
+        i = len(steps) - 1
 
-        # Move to next step
-        state_index["value"] += 1
-        visual, explain, idx = update_fn(state_index["value"], steps)
+    # Keep looping while autoplay_flag is True and we haven't hit the end
+    while True:
+        # If autoplay flag was turned off externally, stop playing
+        if not autoplay_flag:
+            # yield the current state so UI shows where we paused
+            visual, explain = steps[i]
+            yield visual, explain, i
+            return
 
-        visual_output.update(visual)
-        explanation_output.update(explain)
+        # Show the current step
+        visual, explain = steps[i]
+        yield visual, explain, i
 
+        # If last step, stop after showing it
+        if i >= len(steps) - 1:
+            return
 
-# Start Autoplay
-def start_autoplay(steps, state_index):
-    autoplay_flag["running"] = True
+        # wait before next step
+        await asyncio.sleep(1.0)
 
-    # Run loop in background thread
-    t = threading.Thread(
-        target=autoplay_loop,
-        args=(steps, state_index, visual_output, explanation_output, update_step),
-        daemon=True
-    )
-    t.start()
-
-    return "▶ Playing..."
-
-
-# Pause autoplay
-def pause_autoplay():
-    autoplay_flag["running"] = False
-    return "⏸ Paused"
-
-
-# Reset autoplay and steps
-def reset_steps():
-    autoplay_flag["running"] = False
-    return 0, "🔄 Reset. Click Play to start again."
+        # advance index
+        i += 1
 
 
 # -----------------------------
-#        UI
+# Gradio UI
 # -----------------------------
+with gr.Blocks(title="Linear Search Visualizer (Autoplay)") as demo:
+    gr.Markdown("# 🔍 Linear Search Visualizer")
+    gr.Markdown("Default array and target are loaded on start — change them if you want. Use Play/Pause/Next/Previous/Reset to control the animation.")
 
-with gr.Blocks() as demo:
-    gr.Markdown("# 🔍 Linear Search Visualizer (Auto-Play Enabled)")
-    gr.Markdown("Now includes auto-play animation + default starting array.")
-
-    # Inputs with DEFAULT VALUES
+    # Inputs with defaults
     with gr.Row():
-        arr_input = gr.Textbox(
-            label="List (comma-separated)",
-            value="4, 1, 9, 2, 7",
-        )
-        target_input = gr.Textbox(
-            label="Target",
-            value="9",
-        )
+        arr_input = gr.Textbox(label="List (comma-separated)", value="4, 1, 9, 2, 7")
+        target_input = gr.Textbox(label="Target", value="9")
 
-    generate_btn = gr.Button("Generate Steps")
-
-    visual_output = gr.HTML("")
-    explanation_output = gr.HTML("")
-
-    # Navigation Buttons
+    # Control buttons
     with gr.Row():
+        generate_btn = gr.Button("Generate Steps")
         prev_btn = gr.Button("⬅ Previous")
         play_btn = gr.Button("▶ Play")
         pause_btn = gr.Button("⏸ Pause")
         reset_btn = gr.Button("🔄 Reset")
         next_btn = gr.Button("Next ➡")
 
-    # State variables
-    state_steps = gr.State([])
-    state_index = gr.State(0)
+    # Visual outputs
+    visual_output = gr.HTML(value="")
+    explanation_output = gr.HTML(value="")
 
-    # Generate Steps
+    # State holders
+    state_steps = gr.State([])          # list of steps
+    state_index = gr.State(0)           # current index (int)
+    state_autoplay = gr.State(False)    # autoplay flag (bool)
+
+    # Generate steps handler
+    def on_generate(arr_s, tgt_s):
+        steps, idx, msg = generate_steps(arr_s, tgt_s)
+        # If error, clear visuals and return message in explanation
+        if msg:
+            return [], 0, "", msg
+        # return steps, index, visual_html, explanation_html
+        visual, explain = ("", "")
+        if steps:
+            visual, explain = steps[0]
+        return steps, 0, visual, explain
+
     generate_btn.click(
-        generate_steps,
+        fn=on_generate,
         inputs=[arr_input, target_input],
-        outputs=[state_steps, state_index, explanation_output],
-    ).then(
-        update_step,
-        inputs=[state_index, state_steps],
-        outputs=[visual_output, explanation_output, state_index],
+        outputs=[state_steps, state_index, visual_output, explanation_output]
     )
 
-    # Previous Step
+    # Prev button
+    def on_prev(idx, steps):
+        if not steps:
+            return "", "", 0
+        new_idx = clamp_index(idx - 1, steps)
+        visual, explain = steps[new_idx]
+        return visual, explain, new_idx
+
     prev_btn.click(
-        lambda idx: idx - 1,
-        inputs=state_index,
-        outputs=state_index,
-    ).then(
-        update_step,
+        fn=on_prev,
         inputs=[state_index, state_steps],
-        outputs=[visual_output, explanation_output, state_index],
+        outputs=[visual_output, explanation_output, state_index]
     )
 
-    # Next Step
+    # Next button
+    def on_next(idx, steps):
+        if not steps:
+            return "", "", 0
+        new_idx = clamp_index(idx + 1, steps)
+        visual, explain = steps[new_idx]
+        return visual, explain, new_idx
+
     next_btn.click(
-        lambda idx, steps: idx + 1,
+        fn=on_next,
         inputs=[state_index, state_steps],
-        outputs=state_index,
-    ).then(
-        update_step,
-        inputs=[state_index, state_steps],
-        outputs=[visual_output, explanation_output, state_index],
+        outputs=[visual_output, explanation_output, state_index]
     )
 
-    # Play
-    play_btn.click(
-        start_autoplay,
-        inputs=[state_steps, state_index],
-        outputs=explanation_output,
-    )
+    # Reset button: stop autoplay and go to 0
+    def on_reset():
+        return [], 0, "", ""  # clear steps, reset index, clear visuals/explanation
 
-    # Pause
-    pause_btn.click(
-        pause_autoplay,
-        outputs=explanation_output,
-    )
-
-    # Reset
     reset_btn.click(
-        reset_steps,
-        outputs=[state_index, explanation_output],
+        fn=on_reset,
+        outputs=[state_steps, state_index, visual_output, explanation_output]
+    )
+
+    # Pause button: sets autoplay flag to False
+    def do_pause():
+        return False, "<b>⏸ Paused</b>"
+
+    pause_btn.click(
+        fn=do_pause,
+        outputs=[state_autoplay, explanation_output]
+    )
+
+    # Play button: first set autoplay flag True, then chain to the async generator
+    def start_play_flag():
+        # this sets the shared flag to True; the .then() will call the generator
+        return True, "<b>▶ Playing...</b>"
+
+    play_btn.click(
+        fn=start_play_flag,
+        outputs=[state_autoplay, explanation_output]
+    ).then(
+        # call the async generator to actually stream updates
+        fn=play_generator,
+        inputs=[state_steps, state_index, state_autoplay],
+        outputs=[visual_output, explanation_output, state_index]
+    )
+
+    # When page loads, generate the default steps so something is visible immediately
+    def initial_load(arr_s, tgt_s):
+        steps, idx, msg = generate_steps(arr_s, tgt_s)
+        if msg:
+            return [], 0, "", msg
+        visual, explain = ("", "")
+        if steps:
+            visual, explain = steps[0]
+        return steps, 0, visual, explain
+
+    demo.load(
+        fn=initial_load,
+        inputs=[arr_input, target_input],
+        outputs=[state_steps, state_index, visual_output, explanation_output]
     )
 
 demo.launch()
