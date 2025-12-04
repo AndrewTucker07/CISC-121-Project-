@@ -136,7 +136,7 @@ with gr.Blocks(title="Linear Search Visualizer") as demo:
     </style>
 
     # 🔍 Linear Search Visualizer  
-    Now with **arrow animation** + **smooth fading transitions**!
+    Hit Generate Steps before Paly
     """)
 
     # Inputs
